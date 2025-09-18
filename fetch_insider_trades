@@ -1,0 +1,409 @@
+import os
+import json
+import time
+import webbrowser
+import pandas as pd
+import yfinance as yf
+import finnhub
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import messagebox
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import pickle
+from collections import defaultdict
+import csv
+import os
+
+# === Finnhub API ===
+api_key = 'cvgsp9pr01qi76d530t0cvgsp9pr01qi76d530tg'
+finnhub_client = finnhub.Client(api_key=api_key)
+
+# === File for cached tickers ===
+CACHE_FILE = os.path.join(os.path.expanduser("~"), "Desktop", "Insider Trades Extracts", "sp500_cached.json")
+WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+# === Helper Functions ===
+def load_cached_sp500():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_sp500_cache(ticker_list):
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(ticker_list, f)
+
+def get_current_sp500_list():
+    try:
+        tables = pd.read_html(WIKI_URL)
+        df = tables[0]
+        symbols = df['Symbol'].tolist()
+        save_sp500_cache(symbols)
+        return symbols
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to fetch S&P 500 list: {e}")
+        return load_cached_sp500()
+
+def get_ranked_sp500_by_market_cap(target_date, top_n=60):
+    tickers = load_cached_sp500() or get_current_sp500_list()
+    market_caps = []
+    print(f"📈 Starting market cap ranking for {len(tickers)} tickers...")
+
+    cache_file = os.path.join(os.path.expanduser("~"), "Desktop", "Insider Trades Extracts", f"marketcap_cache_{target_date.strftime('%Y%m%d')}.pkl")
+    if os.path.exists(cache_file):
+        print("📦 Loading market caps from cache...")
+        with open(cache_file, 'rb') as f:
+            cached_caps = pickle.load(f)
+        df = pd.DataFrame(cached_caps, columns=['Symbol', 'MarketCap'])
+        return df.sort_values(by='MarketCap', ascending=False).head(top_n)
+
+    def fetch_market_cap(symbol):
+        try:
+            yf_symbol = symbol.replace('.', '-')
+            ticker = yf.Ticker(yf_symbol)
+            hist = ticker.history(start=target_date, end=target_date + timedelta(days=1))
+            if hist.empty:
+                return None
+            price = hist['Close'].iloc[0]
+            shares = ticker.info.get('sharesOutstanding', None)
+            if not shares:
+                return None
+            market_cap = price * shares
+            return (symbol, market_cap)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_market_cap, symbol): symbol for symbol in tickers}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching Market Caps"):
+            result = future.result()
+            if result:
+                market_caps.append(result)
+
+    if not market_caps:
+        print("🚫 No market caps were successfully calculated!")
+    else:
+        print(f"🏁 Finished calculating market caps for {len(market_caps)} tickers")
+
+    with open(cache_file, 'wb') as f:
+        pickle.dump(market_caps, f)
+        print(f"💾 Cached market cap data to {cache_file}")
+
+    df = pd.DataFrame(market_caps, columns=['Symbol', 'MarketCap'])
+    return df.sort_values(by='MarketCap', ascending=False).head(top_n)
+
+
+def aggregate_insider_trades(trade_data):
+    summary = defaultdict(lambda: {
+        'total_trades': 0,
+        'net_shares': 0,
+        'total_value': 0.0,
+        'roles': set(),
+    })
+
+    for trade in trade_data:
+        symbol = trade.get("symbol")
+        if not symbol:
+            continue  # Skip malformed trade records
+        shares = trade.get("share", 0) or 0
+        price = trade.get("price", 0.0) or 0.0
+        tx_type = trade.get("transactionType", "")
+        role = trade.get("title", "")
+
+        multiplier = 1 if tx_type.upper() == "P" else -1
+        value = shares * price * multiplier
+
+        entry = summary[symbol]
+        entry['total_trades'] += 1
+        entry['net_shares'] += shares * multiplier
+        entry['total_value'] += value
+        if role:
+            entry['roles'].add(role)
+
+    for data in summary.values():
+        data['roles'] = ", ".join(sorted(data['roles']))
+
+    return pd.DataFrame.from_dict(summary, orient='index').reset_index().rename(columns={'index': 'Symbol'})
+
+
+def add_return_columns(df, rank_date, windows=[30, 60, 90]):
+    delay_required = len(df['Symbol']) > 60
+    for days_forward in windows:
+        results = []
+        for symbol in tqdm(df['Symbol'], desc=f"{days_forward}d returns"):
+            try:
+                start_date = rank_date
+                end_date = start_date + timedelta(days=days_forward)
+                from_unix = int(start_date.timestamp())
+                to_unix = int(end_date.timestamp())
+
+                candles = finnhub_client.stock_candles(symbol, 'D', from_unix, to_unix)
+                if candles['s'] != 'ok' or len(candles['c']) < 2:
+                    raise ValueError("Insufficient data")
+
+                start_price = candles['c'][0]
+                end_price = candles['c'][-1]
+                forward_return = ((end_price - start_price) / start_price) * 100
+            except Exception:
+                forward_return = None
+            results.append(forward_return)
+
+            if delay_required:
+                time.sleep(1.1)
+
+        df[f"{days_forward}d_forward_return_%"] = results
+    return df
+
+
+
+def export_aggregated_insider_data(trade_data, rank_date, label):
+    df = aggregate_insider_trades(trade_data)
+    df = add_return_columns(df, rank_date)
+    folder = os.path.join(os.path.expanduser("~"), "Desktop", "Insider Trades Extracts")
+    os.makedirs(folder, exist_ok=True)
+    filename = f"{label} Insider Summary {rank_date.strftime('%m-%d-%y')}.csv"
+    path = os.path.join(folder, filename)
+
+    try:
+        df.to_csv(path, index=False)
+        print(f"✅ Aggregated insider summary saved to {path}")
+    except Exception as e:
+        print(f"❌ Failed to save insider summary: {e}")
+
+def fetch_insider_trades(tickers, rank_date, days_back, label):
+    import csv
+
+    try:
+        print("🔍 Entered fetch_insider_trades")
+        start_date = (rank_date - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        end_date = rank_date.strftime("%Y-%m-%d")
+        print(f"🕓 Filtering from {start_date} to {end_date}")
+
+        collected_data = []
+
+        # Show progress bar for user awareness
+        for i, symbol in enumerate(tqdm(tickers, desc="📡 Fetching Insider Trades")):
+            try:
+                print(f"📡 Fetching trades for {symbol}")
+                response = finnhub_client.stock_insider_transactions(symbol)
+                print(f"✅ Got response for {symbol}")
+                for item in response.get("data", []):
+                    tx_date = item.get("transactionDate")
+                    if tx_date and start_date <= tx_date <= end_date:
+                        collected_data.append({
+                            "symbol": symbol,
+                            "transactionDate": tx_date,
+                            "share": item.get("share"),
+                            "price": item.get("transactionPrice"),
+                            "filingDate": item.get("filingDate"),
+                            "transactionType": item.get("transactionType"),
+                            "name": item.get("name"),
+                            "title": item.get("title"),
+                        })
+
+                # 💤 Wait ~1.1 seconds per request to stay under 60/min
+                time.sleep(1.1)
+
+            except Exception as e:
+                print(f"⚠️ Error fetching trades for {symbol}: {e}")
+
+
+        print(f"📊 Collected {len(collected_data)} total records")
+
+        folder = os.path.join(os.path.expanduser("~"), "Desktop", "Insider Trades Extracts")
+        os.makedirs(folder, exist_ok=True)
+        filename = f"{label} Insider Trades {rank_date.strftime('%m-%d-%y')}.csv"
+        path = os.path.join(folder, filename)
+
+        if not collected_data:
+            def notify_empty():
+                msg = f"No insider trades found from {start_date} to {end_date}."
+                print(f"⚠️ {msg}")
+                status_var.set("⚠️ No insider trades found.")
+                messagebox.showinfo("No Data", msg)
+            root.after(0, notify_empty)
+            return
+
+        print(f"💾 Writing data to {path}")
+
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=collected_data[0].keys())
+            writer.writeheader()
+            writer.writerows(collected_data)
+
+        def notify_success():
+            message = f"✅ Exported {len(collected_data)} records to:\n{path}"
+            print(message)
+            status_var.set(f"✅ Exported {len(collected_data)} records to {path}")
+            messagebox.showinfo("Success", message)
+
+        root.after(0, notify_success)
+    except Exception as e:
+        print(f"🔥 Uncaught error in fetch_insider_trades: {e}")
+        root.after(0, lambda: messagebox.showerror("Critical Error", str(e)))
+
+# === GUI Actions ===
+def start_extraction():
+    def safe_fetch():
+        try:
+            print("🚀 Starting background extraction thread...")
+            fetch_insider_trades(selected, rank_date, days_back, label)
+        except Exception as e:
+            print(f"❌ Error in background thread: {e}")
+            root.after(0, lambda: messagebox.showerror("Thread Error", str(e)))
+            root.after(0, lambda: status_var.set("❌ Background thread crashed."))
+
+    try:
+        print("🔧 Preparing extraction parameters...")
+        use_manual = manual_mode.get()
+
+        print("📅 Parsing rank date...")
+        rank_date = datetime.strptime(date_entry.get(), "%Y-%m-%d")
+
+        print("🔢 Parsing days back...")
+        days_back = int(days_entry.get())
+        if days_back > 90:
+            raise ValueError("Days back cannot exceed 90.")
+
+        if use_manual:
+            print("📝 Manual mode active...")
+            selected = [ticker_listbox.get(i) for i in ticker_listbox.curselection()]
+            print(f"📌 Selected tickers: {selected}")
+            if not selected:
+                raise ValueError("You selected manual mode but no tickers were selected.")
+            label = "Custom"
+        else:
+            print("📊 Auto mode active... Getting top N...")
+            top_n = int(top_n_entry.get())
+            print(f"🔍 Getting top {top_n} companies by market cap...")
+            ranked_df = get_ranked_sp500_by_market_cap(rank_date, top_n)
+            selected = ranked_df['Symbol'].tolist()
+            label = f"Top {top_n}"
+            status_var.set(f"📋 Using top {top_n} companies by market cap.")
+
+        print(f"✅ Final list of tickers: {selected[:5]}... (total: {len(selected)})")
+
+        status_var.set("🔄 Starting extraction...")
+        root.update_idletasks()
+        threading.Thread(target=safe_fetch).start()
+
+    except Exception as e:
+        print(f"🛑 Error preparing extraction: {e}")
+        messagebox.showerror("Error", str(e))
+        status_var.set("❌ Extraction failed.")
+
+
+def refresh_tickers():
+    def threaded_refresh():
+        try:
+            refresh_btn.config(state="disabled")
+            rank_date = datetime.strptime(date_entry.get(), "%Y-%m-%d")
+            top_n = int(top_n_entry.get())
+            ranked_df = get_ranked_sp500_by_market_cap(rank_date, top_n)
+            ticker_listbox.delete(0, tk.END)
+            for ticker in ranked_df['Symbol']:
+                ticker_listbox.insert(tk.END, ticker)
+            status_var.set(f"✅ Loaded top {top_n} companies from {rank_date.date()}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            refresh_btn.config(state="normal")
+    threading.Thread(target=threaded_refresh).start()
+
+def open_wiki_link():
+    webbrowser.open(WIKI_URL)
+
+def preload_cached_tickers():
+    cached_tickers = load_cached_sp500()
+    if cached_tickers:
+        ticker_listbox.delete(0, tk.END)
+        for ticker in cached_tickers:
+            ticker_listbox.insert(tk.END, ticker)
+        status_var.set("✅ Loaded cached S&P 500 list.")
+
+def add_manual_ticker():
+    symbol = manual_entry.get().strip().upper()
+    if symbol and symbol not in ticker_listbox.get(0, tk.END):
+        ticker_listbox.insert(tk.END, symbol)
+        status_var.set(f"✅ Added {symbol} to the list.")
+
+def search_ticker_list(event):
+    search_term = search_entry.get().strip().lower()
+    ticker_listbox.selection_clear(0, tk.END)
+    for i, ticker in enumerate(ticker_listbox.get(0, tk.END)):
+        if search_term in ticker.lower():
+            ticker_listbox.see(i)
+            ticker_listbox.selection_set(i)
+            break
+
+def select_all_tickers():
+    ticker_listbox.select_set(0, tk.END)
+
+# === GUI Layout ===
+root = tk.Tk()
+root.title("Insider Trade Extractor GUI")
+
+manual_mode = tk.BooleanVar()
+manual_mode.set(False)
+
+mode_frame = tk.Frame(root)
+mode_frame.pack(pady=(10, 0))
+manual_mode_radio = tk.Radiobutton(mode_frame, text="🧐 Use Top Ranked Companies", variable=manual_mode, value=False, command=lambda: manual_frame.pack_forget())
+manual_mode_radio.pack(anchor='w')
+manual_select_radio = tk.Radiobutton(mode_frame, text="🗘️ Manually Select Tickers", variable=manual_mode, value=True, command=lambda: manual_frame.pack())
+manual_select_radio.pack(anchor='w')
+
+manual_frame = tk.Frame(root)
+search_label = tk.Label(manual_frame, text="🔍 Search ticker list:")
+search_label.pack()
+search_entry = tk.Entry(manual_frame)
+search_entry.pack()
+search_entry.bind("<KeyRelease>", search_ticker_list)
+search_entry.insert(0, "Search ticker...")
+manual_entry = tk.Entry(manual_frame)
+manual_entry.pack()
+manual_entry.insert(0, "Enter custom ticker")
+tk.Button(manual_frame, text="➕ Add Ticker", command=add_manual_ticker).pack(pady=2)
+tk.Label(manual_frame, text="🎯 Select Tickers From List:").pack()
+ticker_listbox = tk.Listbox(manual_frame, selectmode="multiple", width=50, height=20)
+ticker_listbox.pack()
+tk.Button(manual_frame, text="✅ Select All Tickers", command=select_all_tickers).pack(pady=(5, 0))
+manual_frame.pack_forget()
+
+tk.Label(root, text="🗕️ Enter the date to rank the S&P 500 (e.g. 2024-01-02):").pack()
+date_entry = tk.Entry(root)
+date_entry.insert(0, "2024-01-02")
+date_entry.pack()
+
+tk.Label(root, text="🏢 How many of the top-ranked companies to include?").pack()
+top_n_entry = tk.Entry(root)
+top_n_entry.insert(0, "60")
+top_n_entry.pack()
+
+refresh_btn = tk.Button(root, text="🔃 Refresh Ticker List", command=refresh_tickers)
+refresh_btn.pack(pady=5)
+
+tk.Button(root, text="🌐 View Source (Wikipedia)", command=open_wiki_link).pack()
+
+tk.Label(root, text="⏳ How many days before the rank date to pull insider trades from (max 90):").pack()
+days_entry = tk.Entry(root)
+days_entry.insert(0, "30")
+days_entry.pack()
+
+tk.Label(root, text="⚠️ Note: Finnhub only supports data from the last 90 days.").pack(pady=(2, 10))
+
+tk.Button(root, text="📊 Start Extraction", command=start_extraction).pack(pady=10)
+
+status_var = tk.StringVar()
+status_label = tk.Label(root, textvariable=status_var, fg="blue")
+status_label.pack(pady=(0, 10))
+status_var.set("Waiting for input...")
+
+preload_cached_tickers()
+root.mainloop()
