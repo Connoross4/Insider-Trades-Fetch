@@ -1,0 +1,97 @@
+#https://finnhub.io/dashboard
+import pandas as pd
+from datetime import datetime
+import os
+
+# === Load today's insider trade file ===
+today_str = datetime.now().strftime("%m-%d-%y")
+filename = f"Insider Trades {today_str}.csv"
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop", filename)
+
+if not os.path.exists(desktop_path):
+    print(f"⚠️ File not found: {desktop_path}")
+    exit()
+
+print(f"\n📂 Loading: {filename}")
+df = pd.read_csv(desktop_path)
+print(f"✅ Loaded {len(df)} records.\n")
+
+# === Clean + Feature Engineering ===
+df = df.copy()
+df['transactionDate'] = pd.to_datetime(df['transactionDate'])
+df['tradeValue'] = df['share'] * df['transactionPrice']
+
+# Remove rows with missing or zero price/share
+clean_df = df[(df['transactionPrice'] > 0) & (df['share'] > 0)].dropna(subset=['transactionPrice', 'share'])
+
+# === Overall Stats ===
+trade_type_counts = clean_df['transactionCode'].value_counts()
+num_purchases = trade_type_counts.get('P', 0)
+num_sales = trade_type_counts.get('S', 0)
+
+overall_stats = {
+    'Total Trades': len(clean_df),
+    'Purchases': num_purchases,
+    'Sales': num_sales,
+    'Avg Shares Traded': round(clean_df['share'].mean(), 2),
+    'Avg Trade Price ($)': round(clean_df['transactionPrice'].mean(), 2),
+    'Avg Trade Value ($M)': round(clean_df['tradeValue'].mean() / 1e6, 2),
+    'Max Trade Value ($B)': round(clean_df['tradeValue'].max() / 1e9, 2),
+    'Min Trade Value ($)': round(clean_df['tradeValue'].min(), 2),
+    'Median Trade Value ($M)': round(clean_df['tradeValue'].median() / 1e6, 2)
+}
+
+print("📊 Overall Descriptive Stats (filtered for valid trades):")
+for stat, value in overall_stats.items():
+    print(f" - {stat}: {value}")
+
+# === Per-Company Summary ===
+per_company = clean_df.groupby('symbol').agg(
+    num_trades=('symbol', 'count'),
+    unique_insiders=('name', 'nunique'),
+    avg_price=('transactionPrice', 'mean'),
+    avg_shares=('share', 'mean'),
+    total_trade_value=('tradeValue', 'sum')
+)
+
+# Add purchase/sale counts per company
+trade_counts = clean_df[clean_df['transactionCode'].isin(['P', 'S'])] \
+    .pivot_table(index='symbol', columns='transactionCode', values='share', aggfunc='count', fill_value=0) \
+    .rename(columns={'P': 'purchases', 'S': 'sales'})
+
+for col in ['purchases', 'sales']:
+    if col not in trade_counts.columns:
+        trade_counts[col] = 0
+
+# Merge and compute sentiment
+per_company = per_company.join(trade_counts, how='left').fillna(0)
+per_company['% buys'] = per_company['purchases'] / (per_company['purchases'] + per_company['sales'])
+per_company['% buys'] = per_company['% buys'].fillna(0)
+
+# Reformat fields
+per_company['avg_shares_m'] = per_company['avg_shares'] / 1e6
+per_company['total_value_b'] = per_company['total_trade_value'] / 1e9
+
+summary = per_company[[
+    'num_trades', 'unique_insiders', 'purchases', 'sales', '% buys',
+    'avg_price', 'avg_shares_m', 'total_value_b'
+]].round(2)
+
+summary = summary.rename(columns={
+    'avg_price': 'avg_price ($)',
+    'avg_shares_m': 'avg_shares (M)',
+    'total_value_b': 'total_value ($B)'
+})
+
+# === Display Top 10 Companies ===
+print("\n🏢 Per-Company Summary (Top 10 by total trade value):")
+print(summary.sort_values(by='total_value ($B)', ascending=False).head(10))
+
+# === Optional: Show top companies with actual purchases ===
+top_buyers = summary[summary['purchases'] > 0].sort_values('purchases', ascending=False)
+
+if not top_buyers.empty:
+    print("\n💸 Companies with Most Insider Purchases:")
+    print(top_buyers[['purchases', 'sales', '% buys', 'total_value ($B)']].head(10))
+else:
+    print("\n💡 No companies reported insider purchases in this dataset.")
