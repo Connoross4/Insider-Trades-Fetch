@@ -1,4 +1,5 @@
 # Insider Trade Extractor & Analysis Toolkit
+<img width="645" height="810" alt="Screenshot 2025-11-19 at 9 18 32 PM" src="https://github.com/user-attachments/assets/6d0f9dc6-9f12-4e82-a00e-6c33240fe7d1" />
 
 This Python project helps investors make more informed decisions by leveraging recent insider trading activity. It streamlines the workflow for traders and analysts seeking actionable insights from insider transactions across the S&P 500 (or custom companies) and provides tools for in-depth data processing and statistical analysis.
 
